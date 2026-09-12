@@ -1,0 +1,23 @@
+# Secrets / environment
+.env
+
+# Downloaded/generated data (Outlook downloads, MIS exports, cleaned report)
+Downloads/
+MIS_Exports/
+
+# Reference workbook (large binary, layout reference only)
+Mphasis_Limited_Pre_Offer_checkwise Dashboard*.xlsx
+
+# Excel lock files
+~$*.xlsx
+~$*.xls
+
+# Python
+__pycache__/
+*.pyc
+
+# Playwright
+.playwright-mcp/
+
+# Logs
+*.log

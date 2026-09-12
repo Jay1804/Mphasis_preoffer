@@ -1,0 +1,8 @@
+streamlit
+pandas
+openpyxl
+xlrd>=2.0.1
+playwright
+pywin32
+python-dotenv
+
