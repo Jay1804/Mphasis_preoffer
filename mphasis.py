@@ -112,6 +112,23 @@ def get_target_inbox(namespace, account_name=""):
     return None
 
 
+def list_outlook_accounts():
+    """Enumerate the top-level Outlook folders (one per configured account/shared
+    mailbox) on this machine, so the UI can offer real, live options instead of
+    guessing or hardcoding one specific person's account. Returns [] if Outlook
+    isn't reachable (not running, COM error, etc.) - callers should fall back to a
+    manual text field in that case."""
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        return [folder.Name for folder in namespace.Folders]
+    except Exception:
+        return []
+    finally:
+        pythoncom.CoUninitialize()
+
+
 def download_latest_from_email(subject_keyword, wait_minutes=10, account_name=""):
     """Search for the latest email with given subject and download its attachment"""
 
@@ -1652,13 +1669,26 @@ mail_subject = st.text_input(
     "Email subject keyword",
     value="Mphasis_Limited | ARS Non Standard Tracker | Pre_Offer_checkwise",
 )
-account_name = st.text_input(
-    "Outlook account (leave blank to use Outlook's default account)",
-    value="jay.chaudhary@authbridge.com",
-    help="If you have multiple accounts in Outlook, this must match the one whose "
-    "Inbox actually receives the tracker email — GetDefaultFolder only searches "
-    "the default account otherwise.",
-)
+_DEFAULT_ACCOUNT_OPTION = "(Use Outlook's default account)"
+_available_accounts = list_outlook_accounts()
+if _available_accounts:
+    _account_choice = st.selectbox(
+        "Outlook account",
+        options=[_DEFAULT_ACCOUNT_OPTION] + _available_accounts,
+        help="Pick the account whose Inbox actually receives the tracker email — "
+        "this list is read live from the Outlook accounts configured on this "
+        "machine, so everyone picks their own rather than reusing someone else's.",
+    )
+    account_name = "" if _account_choice == _DEFAULT_ACCOUNT_OPTION else _account_choice
+else:
+    account_name = st.text_input(
+        "Outlook account (leave blank to use Outlook's default account)",
+        value="",
+        help="Couldn't read the Outlook account list automatically (e.g. Outlook "
+        "isn't running) — type the account name manually. If you have multiple "
+        "accounts in Outlook, this must match the one whose Inbox actually "
+        "receives the tracker email.",
+    )
 wait_time = st.number_input("Search time (minutes)", min_value=1, max_value=15, value=5, step=1)
 
 st.caption("✅ Outlook is running" if is_outlook_running() else "❌ Outlook is NOT running")
