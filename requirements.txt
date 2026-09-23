@@ -2,7 +2,7 @@ streamlit
 pandas
 openpyxl
 xlrd>=2.0.1
-playwright
+mysql-connector-python
 pywin32
 python-dotenv
 

@@ -1,9 +1,9 @@
 # Mphasis Tracker
 
 Single-file Streamlit app (`mphasis.py`) that downloads the latest Mphasis ARS
-tracker Excel file from Outlook, cleans and annotates it, then drives the
-AuthBridge MIS export-query tool to pull a supplementary "Major Discrepancy"
-dataset and merge it back in.
+tracker Excel file from Outlook, cleans and annotates it, then queries the
+`checkpoint_live` MySQL database directly to pull supplementary Advance
+Tracker / Case History / Sent Cases data and merge it back in.
 
 ## Run
 
@@ -12,14 +12,18 @@ streamlit run mphasis.py
 ```
 
 Requires Outlook to be running on the same Windows machine (uses `win32com.client`
-COM automation, not the Graph API). Also requires the `playwright` package and a
-real installed Chrome browser for the MIS automation step — `run_ars_query()`
-launches via `channel="chrome"` rather than Playwright's bundled Chromium (see
-gotcha below for why); `playwright install chromium` alone is not sufficient.
-Also requires a real installed copy of Excel on the same machine —
-`add_status_view_sheet()` drives it via COM automation (a hidden instance) to
-build genuine, live PivotTables, since openpyxl cannot create real
-PivotTable objects at all.
+COM automation, not the Graph API). Also requires network access to the
+`checkpoint_live` MySQL DB (an AWS RDS instance) and the `mysql-connector-python`
+package — see "MIS data retrieval: direct DB query" below. Also requires a real
+installed copy of Excel on the same machine — `add_status_view_sheet()` drives
+it via COM automation (a hidden instance) to build genuine, live PivotTables,
+since openpyxl cannot create real PivotTable objects at all.
+
+Historical note: this step originally drove the AuthBridge MIS export-query
+website (`https://mis.authbridge.com/export_query/`) via browser automation
+— first Selenium, later Playwright — before being replaced with a direct DB
+connection (see below). Neither Playwright nor a Chrome browser is required
+anymore for this step.
 
 ## Flow
 
@@ -52,15 +56,14 @@ PivotTable objects at all.
      number list formula (`="'"&C{row}&"'"&IF(C{row+1}<>"",",","")`) — each row
      checks the *next* row's column C to decide the trailing comma
    - saves the result as `Mphasis_Limited_Pre_Offer_checkwise Dashboard.xlsx` in the same directory
-4. **Run ARS Query in MIS** — one button handler chains: `run_ars_query` (login +
-   Advance Tracker) → `export_and_download` → `add_red_remarks_sheet` →
-   `select_query` + `fill_ars_number_field` (Case History, same session) →
-   `export_and_download` again → `add_form_submission_l2_sheet` →
-   `add_l2_check_addition_oldest_sheet` → `select_query` + `fill_ars_number_field`
-   (Sent Cases, same session) → `export_and_download` again →
-   `add_l2_report_sent_sheet` → `update_case_status_from_l2_report_sent` →
-   `add_l2_summary_columns` → `add_status_view_sheet` → `apply_professional_styling`.
-   See below. (`clean_latest_excel_file`, step 3, also calls `_write_holiday_list_sheet()`
+4. **Run ARS Query** — one button handler chains: `_execute_ars_query(ADVANCE_TRACKER_QUERY, ...)`
+   → `add_red_remarks_sheet` → `_execute_ars_query(CASE_HISTORY_QUERY, ...)` →
+   `add_form_submission_l2_sheet` → `add_l2_check_addition_oldest_sheet` (both off
+   the same Case History result — one query, reused for both sheets) →
+   `_execute_ars_query(SENT_CASES_QUERY, ...)` → `add_l2_report_sent_sheet` →
+   `update_case_status_from_l2_report_sent` → `add_l2_summary_columns` →
+   `add_status_view_sheet` → `apply_professional_styling`.
+   See "MIS data retrieval: direct DB query" below. (`clean_latest_excel_file`, step 3, also calls `_write_holiday_list_sheet()`
    to set up the `Holiday List` sheet + `a` named range that both its own N
    ("Due Date") formula and `add_l2_summary_columns`'s Z formula depend on —
    see the Holiday List gotcha below. It also calls
@@ -87,75 +90,172 @@ adds, existing wider column widths preserved (the width logic only
 increases, never shrinks), `red remarks` wraps correctly at an 80-wide
 column C.
 
-## Step 4 in detail: MIS export-query automation
+## Step 4 in detail: MIS data retrieval — direct DB query
 
-As of this rewrite, this step is driven by **Playwright**, not Selenium (see
-the "Selenium → Playwright" gotcha below for why, and what changed).
+This step used to drive the AuthBridge MIS export-query website via browser
+automation (first Selenium, later Playwright) — logging in, selecting Host /
+Database / Data Time Slab / Query dropdowns, clicking Export, and downloading
+a CSV/zip. It now connects **directly to the `checkpoint_live` MySQL DB**
+(an AWS RDS instance) and runs the same three SQL queries the website ran
+server-side, via `mysql-connector-python`. Same data, same column names, no
+browser, no MIS website dependency at all. The Playwright/Selenium era is
+summarized as history near the end of "Key gotchas" below, in case browser
+automation ever needs reviving; none of that code exists in `mphasis.py`
+anymore.
 
-`run_ars_query(data_time_slab_keyword, query_name)` drives Playwright/Chromium to:
-1. Log into `https://mis.authbridge.com/export_query/login.php` with
-   `MIS_USERNAME` / `MIS_PASSWORD` (hardcoded constants — see gotcha below).
-2. Select Host → `MIS_HOST` ("Bridge Live"), Database → `MIS_DATABASE`
-   ("Bridge Live"). Both are currently hardcoded; only the query type/name vary
-   per call.
-3. Call `select_query(page, data_time_slab_keyword, query_name)`, which
-   selects **Data Time Slab** to the option matching `data_time_slab_keyword`
-   as a case-insensitive substring (e.g. `"Case Query"` matches the actual
-   option text `"case query - Bridge"`) and **Query** to `query_name` exactly
-   (e.g. `"Advance Tracker"`, `"Case History"`). This reveals an `ARS No*`
-   field — `input[name="check_id1"]`, i.e.
-   `//*[@id='date']/tbody/tr[2]/td[2]/input`.
+**Credentials & connection** (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+`DB_PASSWORD`, all from `.env` — see the credentials gotcha below):
+`get_db_connection()` opens a fresh `mysql.connector` connection per query
+(not pooled/shared across the three queries — mirrors how the old Playwright
+flow made 3 independent requests in one browser session, without needing to
+keep a DB connection alive across the whole Streamlit button-click
+lifecycle).
 
-`select_query()` and `fill_ars_number_field()` are standalone (not just internal
-to `run_ars_query`) specifically so a **second query can reuse the same logged-in
-browser session** instead of opening another Chrome window and logging in again
-— see the button handler flow below.
+**The three queries** (`ADVANCE_TRACKER_QUERY`, `CASE_HISTORY_QUERY`,
+`SENT_CASES_QUERY` in `mphasis.py`) are stored **verbatim** as given — same
+joins, same `CASE WHEN` status/severity mappings, same subqueries for
+`First_Insuff_Date`/`Last_Inerim_Report_Sent_Date`/etc. `check_id1` is the
+literal placeholder text from the site's own SQL (its ARS-number-list
+substitution point) — kept as-is rather than rewritten to a named parameter,
+and swapped for a parameterized `%s,%s,...` IN-list at execute time by
+`_execute_ars_query(sql_template, ars_numbers)`, which does
+`sql_template.replace("check_id1", placeholders)` then
+`cursor.execute(query, ars_numbers)` — ARS numbers are always bound as query
+parameters, never string-interpolated into the SQL text. Returns
+`(header, data_rows, error)`: `header` is `[d[0] for d in cursor.description]`,
+`data_rows` a list of tuples — the same `(header, rows)` shape
+`_read_export_csv_rows()` used to hand back from a parsed CSV, so every
+`add_*_sheet` function below only needed to accept rows directly instead of a
+file path, not a logic rewrite. **Verified against the live DB** at full
+production scale (3,395 ARS numbers): Advance Tracker returned 21,001 rows,
+Case History 591,328 rows (see the performance note directly below — Case
+History is no longer fetched unfiltered in the actual app), Sent Cases 6,964
+rows — all three queries, and every downstream
+`add_*_sheet`/`update_case_status_from_l2_report_sent`/`add_l2_summary_columns`
+step, ran end-to-end successfully against real production data before this
+rewrite was considered done.
 
-Every step below that reads an MIS export (`add_red_remarks_sheet`,
-`add_form_submission_l2_sheet`, `add_l2_check_addition_oldest_sheet`,
-`add_l2_report_sent_sheet`) goes through the shared `_read_export_csv_rows()`
-helper first, which transparently handles both a plain `.csv` and a
-`.csv.zip` download (Chrome/the site can hand back either) and returns the
-parsed rows including the header — none of those functions parse the file
-format themselves.
+**Performance: Case History is filtered server-side, not in Python.**
+`_execute_ars_query()` takes an optional `extra_where`/`extra_params` pair,
+appended as `AND (<extra_where>)` onto the query template's existing WHERE
+clause (each `*_QUERY` template's WHERE is its last clause with nothing
+after it, so plain string concatenation is safe — no derived-table wrapping
+needed, see below for why that specifically doesn't work here). The button
+handler calls `CASE_HISTORY_QUERY` with
+`extra_where="ech.ACTION_COMMENTS = %s OR ech.ACTION_TAKEN = %s"` and
+`extra_params=[FORM_SUBMISSION_L2_COMMENT, CASE_REOPENED_ACTION]` — the exact
+two conditions `add_form_submission_l2_sheet`/`add_l2_check_addition_oldest_sheet`
+already filtered for in Python, now pushed down to MySQL instead. **Verified
+both for correctness and speed** against the live DB (497 ARS numbers): the
+SQL-filtered result and the old fetch-everything-then-filter-in-Python result
+are byte-identical row sets (0 rows differing either way), while the fetch
+itself dropped from 16.2s/108,508 rows to 0.92s/2,313 rows. At full
+production scale (3,395 ARS numbers) this took Case History from 591,328
+unfiltered rows down to 15,695 — an exact match for
+`Form submisison - L2` (8,577) + `L2 check addition (Oldest)` (7,118) counts
+confirmed in an earlier full run — while cutting that query's fetch time from
+tens of seconds to ~6s. Don't revert this to fetching Case History
+unfiltered "to keep the query simple" — the two-condition filter is exactly
+what's consumed downstream, nothing is lost.
+
+**Why this filter is appended directly to the flat query rather than via a
+`SELECT * FROM (CASE_HISTORY_QUERY) t WHERE ...` wrapper** (which would have
+kept `CASE_HISTORY_QUERY`'s own text even more clearly untouched): confirmed
+live that the wrapper form fails with
+`mysql.connector.errors.ProgrammingError: 1060 (42S21): Duplicate column
+name 'ACTION_TAKEN_BY'`. `CASE_HISTORY_QUERY`'s `SELECT` list has both an
+explicit `CONCAT(user_first_name,' ',user_last_name) AS action_taken_by` and
+`ech.*` (which separately includes the raw `ACTION_TAKEN_BY` foreign-key
+column) — MySQL column names are case-insensitive, so these two collide.
+A flat `SELECT`'s result set tolerates duplicate/colliding column names
+just fine (confirmed: `cursor.description` lists both `'action_taken_by'`
+and `'ACTION_TAKEN_BY'` as separate entries), but materializing that same
+result set as a derived table does not. Appending straight onto the
+existing WHERE clause never creates a derived table, so this doesn't apply.
+If a future query ever needs the derived-table form for some other reason,
+expect this same collision.
+
+**Two type-handling differences from the old CSV-parsing path**, both
+confirmed live:
+- **DB rows carry real Python types, not strings.** `ACTION_TAKEN_ON` and
+  `report_sent_on` come back as real `datetime.datetime` objects (confirmed:
+  `type(row[aton_col])` is `datetime.datetime`), not the zero-padded
+  `YYYY-MM-DD HH:MM:SS` strings the old CSV export gave. Sorting by these
+  columns now compares real datetimes directly (more robust than the old
+  lexical string sort) — but plain `sorted()`/`.sort()` raises `TypeError`
+  comparing `None` to a `datetime` if any row has a blank timestamp, so every
+  sort here uses the `_none_first_sort_key()` helper (`(value is None,
+  value)`) instead of a bare `row[col]` key.
+- **`_excel_safe()` converts `decimal.Decimal` to `float`** before any DB row
+  is written into an openpyxl sheet via `ws.append(...)` — DECIMAL/NUMERIC
+  columns come back as `Decimal`, which openpyxl cannot write directly and
+  raises on. `add_form_submission_l2_sheet`, `add_l2_check_addition_oldest_sheet`,
+  and `add_l2_report_sent_sheet` all map every row through this before
+  appending. `add_l2_report_sent_sheet`'s `report_sent_on`-to-date reduction
+  (needed so the destination `dd-mmm-yy` number format applies) now branches
+  on `isinstance(raw_value, datetime)` / `isinstance(raw_value, date)` first,
+  falling back to the old string-parsing only if the value somehow arrives as
+  a string.
 
 The button handler:
-1. Builds the ARS number list **directly from `Mphasis_Limited_Pre_Offer_checkwise Dashboard.xlsx` column C**
-   via `get_ars_number_list()` — not by reading the AC column's formula (openpyxl
+1. Builds the raw ARS number list **directly from `Mphasis_Limited_Pre_Offer_checkwise Dashboard.xlsx` column C**
+   via `get_ars_numbers()` — not by reading the AC column's formula (openpyxl
    never evaluates formulas, so AC would just return unevaluated formula text).
-   The generated string is equivalent to what AC would show once opened in Excel.
-2. `run_ars_query("Case Query", "Advance Tracker")` → `fill_ars_number_field()`
-   pastes it into the ARS No field.
-3. `export_and_download()` clicks the Export button
-   (`/html/body/div/div/div[2]/form/input`) inside a `page.expect_download()`
-   block and saves the resulting `Download` object into `MIS_EXPORT_DIR`
-   (`Downloads/MIS_Exports/`, kept separate from tracker files so it never gets
-   picked up as the "latest" source file). This listens for the browser's
-   actual download event directly, rather than polling the filesystem for a
-   new file — see the gotcha below for why that distinction mattered.
-4. `add_red_remarks_sheet(downloaded_file)`:
-   - reads the exported file (plain `.csv` or `.csv.zip`, both handled)
+   Returns a plain Python list (no manual quoting needed — `_execute_ars_query`
+   binds it as parameters).
+2. `_execute_ars_query(ADVANCE_TRACKER_QUERY, ars_numbers)`.
+3. `_execute_ars_query(CASE_HISTORY_QUERY, ars_numbers, extra_where=..., extra_params=...)`
+   — run **once** (server-side-filtered, see the performance note above), its
+   `(header, rows)` reused for both `add_form_submission_l2_sheet` and
+   `add_l2_check_addition_oldest_sheet` (avoids querying Case History twice
+   for what used to be two separate exports of the same underlying query).
+4. `_execute_ars_query(SENT_CASES_QUERY, ars_numbers)`.
+5. **One `load_workbook()` → mutate → one `wb.save()`** for everything from
+   here through `add_l2_summary_columns()`: `add_red_remarks_sheet`,
+   `add_form_submission_l2_sheet`, `add_l2_check_addition_oldest_sheet`,
+   `add_l2_report_sent_sheet`, `update_case_status_from_l2_report_sent`, and
+   `add_l2_summary_columns` all now take an already-open `wb` as their first
+   argument and neither open nor save the file themselves — the button
+   handler does `wb = load_workbook(cleaned_file_path)` once, calls all six
+   in sequence, then `wb.save(cleaned_file_path)` once. This replaced 6
+   separate full load+parse+save round trips on a workbook that can hold
+   tens of thousands of audit-sheet rows, which dominated this step's
+   wall-clock time even more than the (now largely fixed) Case History
+   over-fetch — confirmed live: the consolidated load+mutate+save pass alone
+   still took ~57s at full production scale (3,395 ARS numbers, ~2,422
+   tracker rows plus ~34K new audit-sheet rows across 4 sheets) — openpyxl's
+   own XML serialization cost for a workbook this size, now paid once instead
+   of 6 times. Each of the six functions' docstrings notes it takes `wb`
+   instead of opening its own — don't revert any single one back to
+   `load_workbook(cleaned_file_path)` / `wb.save(...)` internally, that
+   reintroduces the redundant round trips for that function specifically.
+6. Then `add_status_view_sheet()` → `apply_professional_styling()`,
+   unchanged from before — these still do their own COM/openpyxl
+   open+save (COM for the pivot build, openpyxl for the final styling pass),
+   since each must run strictly after the previous step's save completes.
+
+`add_red_remarks_sheet(wb, header, data_rows)`:
    - filters rows to `check_severity` in `RED_REMARKS_SEVERITIES` (`Major
      Discrepancy`, `Amber`, `Minor Discrepancy`) **AND** `Check_unique_name`
      in `RED_REMARKS_CHECK_NAMES` (`UAN Check for Undisclosed Employment`,
      `Dual Employment Verification via Form 26AS`, `Criminal Records
      Verification`, `National Identity Check`, `India Court Record Check
-     through Law Firm`) — both exact match, both required
+     through Law Firm`) — both exact match, both required. Confirmed live:
+     `check_severity` values seen are `Green`, `None`, `Amber`, `Major
+     Discrepancy`, `Minor Discrepancy` — matches the filter set exactly.
    - groups the filtered rows by `case_ars_no` and joins each ARS's
      `closure_comments` with `", "` into **one row per unique ARS** (an ARS
      can have multiple matching checks, e.g. both a Dual Employment and a UAN
-     check) — this is a real behavior change from the original "keep every
-     matching row as-is" version; verified to reproduce the exact expected
-     combined-comment text against a real export for 16 sample ARS numbers
-     (e.g. ARS `3055-016865` → `"Possible dual employment is found....,
-     Verification could not be possible as the EPFO portal is not
-     working...."`, joined in row-encounter order, not sorted)
+     check) — verified to reproduce the exact expected combined-comment text
+     against a real export for 16 sample ARS numbers (e.g. ARS
+     `3055-016865` → `"Possible dual employment is found...., Verification
+     could not be possible as the EPFO portal is not working...."`, joined in
+     row-encounter order, not sorted)
    - writes `case_ars_no` → combined `closure_comments` into a new `red
      remarks` sheet in `Mphasis_Limited_Pre_Offer_checkwise Dashboard.xlsx` (column B = `case_ars_no`,
      column C = combined `closure_comments`; replacing the sheet if it
-     already exists) — **not** the full ~75-column raw rows the original
-     version kept for audit purposes; this sheet is now a 3-column (A blank,
-     B, C) aggregation, not a raw data dump
+     already exists) — a 3-column (A blank, B, C) aggregation, not a raw data
+     dump of every matching row
    - fills `Pre_Offer_checkwise!W3:W{last row}` — the tracker's existing
      `Red Remarks` header column — with
      `=IFERROR(VLOOKUP(C{row},'red remarks'!B:AB,2,0),"")`, which looks up the
@@ -163,24 +263,20 @@ The button handler:
      column C (the combined `closure_comments`, the 2nd column of the B:AB
      range — the `AB` upper bound is arbitrary headroom, nothing needs to
      actually exist past column C for this to work)
-5. On the **same** `page`, `select_query(page, "Case Query", "Case
-   History")` (option `//*[@id='...']/select/option[15]` in the Query dropdown,
-   verified live) + `fill_ars_number_field()` re-pastes the same ARS number list,
-   then `export_and_download()` downloads `Case History.csv.zip` (much larger
-   than the Advance Tracker export, ~2.3MB vs ~160KB, since it's full case
-   history detail rather than one row per check).
-6. `add_form_submission_l2_sheet(case_history_file)`:
+
+`add_form_submission_l2_sheet(wb, header, data_rows)`:
    - filters the Case History rows to `ACTION_COMMENTS == FORM_SUBMISSION_L2_COMMENT`
      (`"Check moved to WIP. Antecedents populated from iBridge candidate
-     submission."`), sorts by `ACTION_TAKEN_ON` oldest-first (plain string sort —
-     safe since the format is zero-padded `YYYY-MM-DD HH:MM:SS`)
+     submission."`), sorts by `ACTION_TAKEN_ON` oldest-first (real `datetime`
+     comparison via `_none_first_sort_key()` — see the type-handling note above)
    - writes the result into a new `Form submisison - L2` sheet (that exact
      spelling/typo, kept verbatim per explicit instruction — don't "fix" it)
    - fills `Pre_Offer_checkwise!X2` with that same sheet name as the header, and
      `X3:X{last row}` with
      `=IFERROR(VLOOKUP(C{row},'Form submisison - L2'!B:T,12,0),"")` (column B =
      `case_ars_no`, the 12th column of B:T = `ACTION_TAKEN_ON`)
-7. `add_l2_check_addition_oldest_sheet(case_history_file)`:
+
+`add_l2_check_addition_oldest_sheet(wb, header, data_rows)`:
    - filters the same Case History rows to `ACTION_TAKEN == CASE_REOPENED_ACTION`
      (`"New Status - Case Reopened"`), same oldest-first sort by `ACTION_TAKEN_ON`
    - writes the result into a new `L2 check addition (Oldest)` sheet
@@ -189,20 +285,18 @@ The button handler:
      `=IFERROR(VLOOKUP(C{row},'L2 check addition (Oldest)'!B:T,12,0),"")` (same
      B:T/column-12 alignment as the `Form submisison - L2` lookup — column B =
      `case_ars_no`, the 12th column of B:T = `ACTION_TAKEN_ON`)
-8. On the **same** `page`, `select_query(page, "Case Query", "Sent
-   Cases")` + `fill_ars_number_field()` re-pastes the same ARS number list,
-   then `export_and_download()` downloads the Sent Cases export.
-9. `add_l2_report_sent_sheet(sent_cases_file)`:
+
+`add_l2_report_sent_sheet(wb, header, data_rows)`:
    - filters rows to `Report Status == "Sent"` AND `Report Type == "Additional"`
-     (both exact match), sorts by `report_sent_on` oldest-first
+     (both exact match, case/whitespace-insensitive via `.strip().lower()`),
+     sorts by `report_sent_on` oldest-first
    - writes the full matching rows into a new `L2 Report Sent` sheet
-     (**column order matches the raw Sent Cases CSV as-is** — `case_ars_no`
-     lands at column **F**, index 5, not B; confirmed live — anything reading
-     this sheet must look up columns by header name, never assume B), then
-     reparses just that sheet's `report_sent_on` column from the exported
-     datetime string into a real `date` value (needed so the destination
-     `dd-mmm-yy` number format below actually applies — a plain text string
-     ignores number formats)
+     (**column order matches the raw Sent Cases query's `SELECT` order** —
+     `case_ars_no` lands at column **F**, index 5, not B; confirmed live —
+     anything reading this sheet must look up columns by header name, never
+     assume B), then reduces just that sheet's `report_sent_on` column to a
+     real `date` value (needed so the destination `dd-mmm-yy` number format
+     below actually applies — see the type-handling note above)
    - **clears** `Pre_Offer_checkwise`'s existing `L2 Report sent date` / `L2
      Report sent severity` column values first, then refills them via
      `INDEX/MATCH` (not `VLOOKUP`) against `L2 Report Sent`, matching on
@@ -210,21 +304,26 @@ The button handler:
      over VLOOKUP here specifically because `case_ars_no` is not known to sit
      to the left of `report_sent_on`/`report_severity` in that sheet (a hard
      requirement for VLOOKUP, but not for INDEX/MATCH) — confirmed true:
-     `case_ars_no` (F) actually sits *right* of neither in this export's
+     `case_ars_no` (F) actually sits *right* of neither in this query's
      column order, so this wasn't just defensive. Both destination columns
      are located by **header name** via `_find_header_col_letter()` (scanning
      row 2) rather than hardcoded letters, for the same reason — see the
      debugging section below before assuming this is wired to the wrong
-     columns.
-10. `update_case_status_from_l2_report_sent()`:
+     columns. Confirmed live: `Report Status` values are `sent` (lowercase,
+     matching the query's own `WHEN 5 THEN 'sent'` CASE branch), `Report
+     Type` values seen are `Additional`/`Final` — filtering to
+     `sent`+`additional` on a 6,964-row Sent Cases result yielded 3,551
+     matching rows.
+
+`update_case_status_from_l2_report_sent(wb)`:
     - for `Pre_Offer_checkwise` rows whose `Case Status` (K) is currently
       `Insufficient` or `On Hold` (both confirmed exact-match strings —
       the only other real values seen are `Completed` and `Work In
       Progress`), overwrites K to `Completed` if that row's ARS number
       appears in the `L2 Report Sent` sheet's `case_ars_no` column (looked
-      up by header name — see step 9's column-order gotcha above; a hardcoded
-      `B` here was a real bug caught before it shipped), otherwise leaves K
-      untouched
+      up by header name — see `add_l2_report_sent_sheet`'s column-order
+      gotcha above; a hardcoded `B` here was a real bug caught before it
+      shipped), otherwise leaves K untouched
     - determines "L2 Report sent date is non-blank" from that same source
       data, **not** by reading `Pre_Offer_checkwise!U`'s cell value — U holds
       an `INDEX/MATCH` formula, and openpyxl never evaluates formulas, so
@@ -245,13 +344,14 @@ The button handler:
       `Insufficient`/`On Hold` at the time happened to be among them, so all
       18 flipped to `Completed`; unrelated rows (already `Completed`/`Work
       In Progress`) were confirmed untouched
-11. `add_l2_summary_columns()` — runs last, since it depends on X (step 6),
-    Y (step 7), U/"L2 Report sent date" (step 9), and the `a` named range
-    (written by `clean_latest_excel_file`, step 3) already being in place.
-    Z/AA depend on X only, not Y; **AB depends on both X and Y** — see the
-    AB bullet below for why that matters (it's not redundant with Z, despite
-    Y and Z both ultimately tracing back to a per-row lookup). Adds three
-    more `Pre_Offer_checkwise` columns, all filled row 3 to the last row:
+`add_l2_summary_columns(wb)` — runs last, since it depends on X
+(`add_form_submission_l2_sheet`), Y (`add_l2_check_addition_oldest_sheet`),
+U/"L2 Report sent date" (`add_l2_report_sent_sheet`), and the `a` named range
+(written by `clean_latest_excel_file`, step 3) already being in place.
+Z/AA depend on X only, not Y; **AB depends on both X and Y** — see the
+AB bullet below for why that matters (it's not redundant with Z, despite
+Y and Z both ultimately tracing back to a per-row lookup). Adds three
+more `Pre_Offer_checkwise` columns, all filled row 3 to the last row:
    - **Z** ("L2 Due Date"): `=IF(X{row}="","",WORKDAY.INTL(X{row},1,11,a))`,
      with `number_format = "dd-mmm-yy"` (same date format as the N/"Due Date"
      column). **Depends on X (`Form submisison - L2`), not Y** — a deliberate
@@ -278,7 +378,7 @@ The button handler:
      blank exactly when X is blank), so the old `AND(X="",Z<>"")` → `"Pending
      at candidate"` branch could mathematically never fire — it was dead
      code. Y comes from an independent VLOOKUP against `'L2 check addition
-     (Oldest)'!B:T` (added by `add_l2_check_addition_oldest_sheet`, step 7),
+     (Oldest)'!B:T` (added by `add_l2_check_addition_oldest_sheet`),
      unrelated to X, so a case can genuinely have Y populated (reopened) with
      X still blank (no form resubmission yet) — the "Pending at candidate"
      branch is real and reachable now. Don't "fix" this back to Z thinking
@@ -512,154 +612,55 @@ pivot is no longer gated on the `L2 Report Sent` sheet's existence the way
   entries parse successfully (verified — 0 unparsed). If this list is ever
   regenerated from a fresh source, re-check that block specifically rather
   than trusting the inference held over.
-- **MIS credentials are hardcoded in plain text** (`MIS_USERNAME`,
-  `MIS_PASSWORD` near the top of `mphasis.py`) — an explicit user choice over
-  env vars/UI input. Don't commit this file anywhere shared without stripping
-  them, and don't "fix" this to env vars without asking first.
-- **`run_ars_query()` launches `channel="chrome"` (the real installed Chrome),
-  not Playwright's bundled Chromium — this is load-bearing, not cosmetic.**
-  On the deployment network, the bundled Chromium got `net::ERR_CONNECTION_CLOSED`
-  hitting `mis.authbridge.com` every time, while `curl` and a real Chrome
-  instance both reached it fine — some corporate proxy/security layer
-  evidently allows the recognized Chrome executable through while blocking
-  the unrecognized bundled one. Confirmed directly: reproduced the failure
-  with the bundled binary, then confirmed `channel="chrome"` fixes it,
-  end-to-end, against the live site. If MIS navigation starts failing with
-  `ERR_CONNECTION_CLOSED` (or similar) again, don't assume the site is down —
-  check whether this got reverted first.
-- **`run_ars_query()` resets the asyncio event loop policy to
-  `WindowsProactorEventLoopPolicy` before starting Playwright — this is also
-  load-bearing.** Streamlit is built on Tornado, which forces the
-  process-wide asyncio policy to `WindowsSelectorEventLoopPolicy` on Windows;
-  `SelectorEventLoop` can't spawn subprocesses on Windows, and Playwright's
-  sync API needs to spawn its driver subprocess on startup, so calling
-  `sync_playwright().start()` from inside a running Streamlit app raised
-  `NotImplementedError` deep inside `asyncio`'s subprocess machinery — every
-  single time, with no exception message text (`str(e)` was empty; only
-  `type(e).__name__` showed anything, which is why `except Exception as e:`
-  handlers in this app show `str(e) or type(e).__name__`, not just
-  `str(e)`). This is exactly why the *identical* code always worked when run
-  as a standalone script (default Windows policy is already Proactor there)
-  but always failed through the actual Streamlit UI — a hard-to-track-down
-  discrepancy that cost significant back-and-forth before being root-caused.
-  Confirmed by reproducing the exact traceback outside Streamlit just by
-  forcing the Selector policy manually, then confirming the reset fixes it.
-  Don't remove this thinking it's unnecessary defensive code.
-- **Selenium → Playwright rewrite.** The MIS automation originally used
-  Selenium/ChromeDriver, and was rewritten to use Playwright after repeated,
-  hard-to-diagnose hangs on the Export click (a raw `HTTPConnectionPool(...):
-  Read timed out (read timeout=120)` from Selenium's own HTTP client — no
-  indication it happened at Export, no catchable exception). Root cause:
-  Selenium's `.click()` on the Export button (a `<form>` submit) blocks until
-  the browser reports the resulting navigation complete; a slow server-side
-  report generation could hang that single `.click()` call for minutes,
-  *before* `export_and_download()`'s own polling loop even started counting
-  (it only began after `.click()` returned). Capping Selenium's page-load
-  timeout and catching the resulting `TimeoutException` worked around one
-  instance of this, but the underlying design — click, then hope, then poll
-  the filesystem — was fragile by construction. Playwright's
-  `page.expect_download()` sidesteps the whole problem: it listens for the
-  browser's actual download event directly, decoupled from whatever the
-  page's navigation/load state is doing, so a slow server response no longer
-  risks hanging the click itself. If MIS automation issues come back, verify
-  first whether they're actually Selenium-shaped (they shouldn't be anymore —
-  there's no more ChromeDriver, no more ports, no more raw HTTP timeouts) before
-  assuming this class of bug has resurfaced.
-- **No more staleness handling needed for dropdowns/fields.** Selenium's
-  `StaleElementReferenceException` dance (`_select_dropdown_option()`
-  re-locating on every retry, `fill_ars_number_field()` retrying the whole
-  locate→clear→send_keys sequence) doesn't apply to Playwright: locators
-  re-resolve the DOM by selector on every action rather than holding a live
-  element handle, and `page.fill()` / `page.select_option()` auto-wait for the
-  target to become actionable. `_select_dropdown_option()` still polls in a
-  loop, but only because the Data Time Slab / Query rebuild is *asynchronous*
-  (the matching `<option>` genuinely doesn't exist for ~400ms after the
-  triggering `onchange`) — not to work around staleness. Don't reintroduce a
-  staleness-retry pattern here; it was solving a Selenium-specific problem.
-- **`table#date` (the ARS No field's container) rebuilds when the *Query*
-  dropdown changes, not when Data Time Slab changes** — confirmed via a local
-  mock-server test built specifically to validate the Playwright rewrite (see
-  below). Don't assume Data Time Slab changes are what invalidate the ARS
-  field.
-- **Re-selecting Data Time Slab (`access_time`) — even to its already-selected
-  value — silently resets the Query dropdown (`csv_query`) back to blank
-  shortly afterward, without rebuilding its option list.** This broke
-  switching queries on a reused session (e.g. Advance Tracker → Case
-  History): `select_query()` re-selects `access_time` first (needed for the
-  *first* query of a session, harmless-looking to repeat for later ones), then
-  immediately selects `csv_query` — and that immediate selection was getting
-  silently wiped a moment later. `select_option()` not raising an exception
-  does **not** mean the selection survived. Confirmed live by direct
-  reproduction: selecting `csv_query` right after re-selecting `access_time`
-  reverted to blank within ~300ms and stayed blank; doing the identical
-  `select_option()` call after a several-second pause stuck reliably.
-  Symptom in the UI was maximally confusing — no exception, no error on the
-  *first* query of a session (Advance Tracker), and the *second* query's
-  Export click silently triggered the site's own `alert('Please select
-  Query.')` (auto-dismissed by Playwright by default, so nothing surfaced it)
-  before `expect_download()` timed out with the generic "Export clicked but
-  no download completed" message — indistinguishable from a genuinely slow
-  server response unless you go looking at what's actually selected.
-  Fixed in `_select_dropdown_option()`: after `select_option()`, it now
-  re-reads the select's actually-selected option text and retries the whole
-  selection if it doesn't match what was just set, rather than trusting
-  `select_option()` not raising as proof of success. This applies to *every*
-  dropdown selection now (hostname/database/access_time/csv_query), not just
-  csv_query — don't special-case it back down to just one dropdown; the
-  general "verify, don't just trust" pattern is the actual fix, and the exact
-  reset trigger/timing on the site's side is still unconfirmed beyond this
-  one reproduction.
-- **Playwright browsers are never closed either** (`.close()` / `.stop()` are
-  never called, mirroring the old "never call `driver.quit()`" intentional
-  behavior — the browser stays open per an explicit prior user request, so it
-  can be reviewed / reused for later queries on the same session).
-  `run_ars_query()` calls `sync_playwright().start()` directly rather than
-  using the `with sync_playwright() as p:` context-manager form specifically
-  *because* exiting that `with` block would tear down the driver connection
-  and close the browser — don't refactor this into a `with` block, it would
-  silently break the "leave it open" behavior. Repeated test runs still
-  accumulate open Chromium windows (no more `chromedriver.exe`, since
-  Playwright talks to the browser directly rather than through a separate
-  driver-server process — but `chrome.exe` process buildup is still possible;
-  check for it the same way as before if automation runs start behaving
-  erratically).
-- **Repeated exports in the same session get de-duplicated filenames** (`Sent
-  Cases.csv`, `Sent Cases (1).csv`, `Sent Cases (2).csv`, ...) via
-  `export_and_download()`'s own counter loop against `dest_path.exists()` in
-  `MIS_EXPORT_DIR` — this replaced relying on Chrome's own auto-rename
-  behavior (which was specific to the old polling-based download flow); it's
-  been verified directly (three exports in one session against a local mock
-  server, distinct filenames, all three files present and readable).
-- **This rewrite has since been verified against the live MIS site, not just
-  the mock.** The mock (see "Testing the Playwright rewrite" below) is what
-  the *initial* Selenium → Playwright rewrite was validated against, before
-  any live-site access was exercised in this project. Since then, the full
-  chain — login, Host/Database/Data Time Slab/Query selection, ARS field
-  fill, and Export/download — has been run against the real site repeatedly
-  and confirmed working end-to-end for all three queries (Advance Tracker,
-  Case History, Sent Cases) in the same session, including finding and fixing
-  two real site-specific issues that the mock didn't (and structurally
-  couldn't) surface: the `channel="chrome"` network-blocking issue, and the
-  Data-Time-Slab-reselection-resets-Query-dropdown behavior. Don't assume
-  "only verified against a mock" still applies when troubleshooting.
-- **`Report Status` in the Sent Cases export is lowercase (`"sent"`), not
-  `"Sent"`.** Verified against a real export (`Sent Cases.csv.zip`, ~4700
-  rows: `sent` × 4694, plus small counts of `Not Sent` / `New` / `Sent for
-  Rework` / etc.). The initial implementation of `add_l2_report_sent_sheet()`
-  did an exact case-sensitive match against `"Sent"` and silently matched
-  zero rows every time — the `L2 Report Sent` sheet was created but always
-  empty, no error raised. Both the `Report Status` and `Report Type` filters
-  now compare `.strip().lower()` against `REPORT_SENT_STATUS.lower()` /
-  `REPORT_SENT_TYPE.lower()` specifically because of this — don't revert to
-  exact `==` matching on these two columns.
-  Everything else in that function was already correct against the real file:
-  header names (`case_ars_no`, `report_sent_on`, `Report Type`,
-  `report_severity`, `Report Status`) match exactly, `Report Type ==
-  "Additional"` matches exactly (2295 of 4710 rows), `report_sent_on` is
-  `YYYY-MM-DD HH:MM:SS` (the first parse format already tried), and
-  `case_ars_no` values look like `3055-016843` (matches `Pre_Offer_checkwise`
-  column C). Filtering to `Report Status == "sent"` AND `Report Type ==
-  "Additional"` yields 2279 rows on this export.
+- **DB credentials live in `.env`** (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+  `DB_PASSWORD`), never hardcoded in `mphasis.py` — loaded via `python-dotenv`'s
+  `load_dotenv()` at import time, read through `os.getenv(...)`. `.env` is
+  gitignored; don't commit it, and don't move these back to hardcoded
+  constants. `DB_PORT` defaults to `3306` if unset. This replaced an earlier,
+  explicitly-approved-at-the-time choice to hardcode the (now-defunct) MIS
+  website's login credentials directly in `mphasis.py` — that tradeoff no
+  longer applies now that there's a real DB connection with its own
+  credentials, which went straight into `.env` from the start.
+- **`check_id1` is swapped for a parameterized IN-list via plain
+  `str.replace()`, never f-string/`%`-interpolation of the ARS numbers
+  themselves.** `_execute_ars_query()` does
+  `sql_template.replace("check_id1", ",".join(["%s"] * len(ars_numbers)))`
+  then `cursor.execute(query, ars_numbers)` — the placeholder *text* is
+  substituted, but the actual ARS number *values* always travel as bound
+  parameters through `mysql-connector-python`, not string-formatted into the
+  query. Don't "simplify" this into building the IN-list by joining quoted
+  ARS numbers into the SQL text directly — that would reintroduce SQL
+  injection risk for no benefit.
+- **DB result rows need type handling that CSV-parsed rows never did** — see
+  "Two type-handling differences from the old CSV-parsing path" earlier in
+  this doc for the full detail (`_none_first_sort_key()` for sorting columns
+  that may be a real `datetime` or `None`; `_excel_safe()` to convert
+  `decimal.Decimal` to `float` before writing into openpyxl). Both were
+  discovered and fixed during this rewrite, not carried over from the CSV
+  era — the CSV path never had this problem because every CSV cell was
+  already a plain string.
+- **Historical: Selenium → Playwright → direct DB query.** MIS data
+  retrieval went through three implementations: Selenium/ChromeDriver (slow,
+  fragile Export-click hangs), then Playwright (fixed the hangs via
+  `page.expect_download()`, but still needed `channel="chrome"` to dodge a
+  network block on the bundled Chromium binary, an asyncio event-loop-policy
+  reset to coexist with Streamlit/Tornado, and a workaround for the MIS
+  site's Query dropdown silently resetting after a Data-Time-Slab
+  reselection), and finally this direct DB connection, which removes the
+  browser — and every one of those browser-specific workarounds — entirely.
+  None of that Selenium/Playwright code exists in `mphasis.py` anymore; if
+  DB access ever becomes unavailable and browser automation needs reviving,
+  treat this as a fresh implementation rather than assuming the old
+  Playwright code (no longer present) can just be restored.
+- **`Report Status` in the Sent Cases query result is lowercase (`"sent"`),
+  not `"Sent"`** — it comes straight from the query's own `WHEN 5 THEN
+  'sent'` CASE branch (see `SENT_CASES_QUERY`), so this isn't a data quirk to
+  work around so much as a fact about the query itself. `add_l2_report_sent_sheet()`
+  compares `.strip().lower()` against `REPORT_SENT_STATUS.lower()` /
+  `REPORT_SENT_TYPE.lower()` for exactly this reason — don't revert to exact
+  `==` matching on these two columns. Confirmed at production scale in this
+  doc's "MIS data retrieval" section above (3,551 of 6,964 Sent Cases rows
+  matched `sent`+`Additional`).
 
 ## Debugging header-matching issues
 
@@ -681,45 +682,14 @@ didn't match reality until the real file was opened and inspected. The same
 actual dropdown flow (Host → Database → Data Time Slab → Query) and the exact
 field/button XPaths before writing any browser-automation code against them.
 
-## Testing the Playwright rewrite
+## Historical: testing the Selenium/Playwright MIS automation (superseded)
 
-Live MIS site access turned out to be available from this dev environment
-after all (credentials are hardcoded in `mphasis.py`, and the site was
-reachable directly) — most debugging in this project ended up happening
-against the real site rather than a mock, and is the stronger source of
-truth where the two disagree. Early on, though, before that was established,
-the initial Selenium → Playwright rewrite was validated against a small
-local `http.server`-based mock replicating the MIS site's key behaviors: a
-login form, Host/Database/Data-Time-Slab/Query dropdowns that rebuild
-asynchronously via `onchange` JS (~400ms delay, matching the real site), a
-`table#date` ARS-field container that rebuilds specifically on Query change,
-and an `/export` endpoint that sleeps a few seconds before responding with
-`Content-Disposition: attachment` (simulating slow server-side report
-generation — the exact scenario that used to hang Selenium).
-
-The mock is still useful as a first-pass sanity check when iterating on
-automation *mechanics* in isolation (faster feedback loop, no risk of
-hammering the real site) — but it's not a substitute for live verification,
-and it structurally can't surface real site quirks it wasn't built to
-simulate (it missed both the `channel="chrome"` issue and the
-Query-dropdown-reset issue, which only showed up live). If MIS automation
-needs debugging again, prefer testing against the live site directly first;
-fall back to a mock like this only if live access isn't available. Two
-non-obvious things that cost real time building the original mock harness,
-worth not re-discovering the hard way:
-- **XPath position predicates apply per-parent-context, not across the
-  flattened result set from the previous step.** For `/a/b/c[2]`, if step
-  `/b` yields matches under multiple different parents, `c[2]` is evaluated
-  *separately within each parent's own children* — it does not mean "the 2nd
-  match overall." Getting this wrong when hand-building test HTML produced a
-  DOM that looked structurally similar to the intended target but resolved
-  to zero or wrong matches for the real site's verified XPath
-  (`/html/body/div/div/div[2]/form/input`, which needs **three** levels of
-  div nesting to resolve uniquely, not two — easy to undercount).
-- **`page.goto()` to a URL that triggers a download raises `"Download is
-  starting"` as an error**, even inside `page.expect_download()` — this is
-  why the code uses `page.click()` on the form's submit button instead.
-  Confirmed directly: swapping `page.click(selector)` for
-  `page.goto(export_url)` inside the same `expect_download()` block
-  reproduces this error immediately. Don't refactor `export_and_download()`
-  to navigate directly to an export URL even if it looks simpler.
+Before MIS data retrieval moved to a direct DB connection (see "MIS data
+retrieval — direct DB query" above), this app drove the MIS export-query
+website via browser automation and was tested against both the live site and
+a local mock server replicating its login form, async dropdown rebuilds, and
+slow `/export` endpoint. None of that browser-automation code, nor the
+XPath/download-navigation quirks it worked around, exists in `mphasis.py`
+anymore — testing this app now means testing DB queries and Excel output, not
+browser mechanics. Kept as a one-line pointer only in case browser automation
+of the MIS website is ever revived from scratch in the future.

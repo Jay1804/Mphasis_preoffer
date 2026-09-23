@@ -1,12 +1,9 @@
 import streamlit as st
-import asyncio
 import time
 import os
-import csv
-import io
-import zipfile
+from decimal import Decimal
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 import subprocess
 import threading
 import win32com.client
@@ -16,7 +13,8 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.workbook.defined_name import DefinedName
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import mysql.connector
+from mysql.connector import Error as MySQLError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,16 +34,19 @@ CLEANED_FILE_NAME = "Mphasis_Limited_Pre_Offer_checkwise Dashboard.xlsx"
 TRIGGER_URL = "https://arsmistracker.authbridge.app/tracker/generate_excel_data/5973?email=true"
 
 # =========================================================
-# MIS EXPORT QUERY TOOL - LOGIN & QUERY CONFIG
+# CHECKPOINT_LIVE DATABASE CONFIG
 # =========================================================
-MIS_LOGIN_URL = os.getenv("MIS_LOGIN_URL", "https://mis.authbridge.com/export_query/login.php")
-MIS_USERNAME = os.getenv("MIS_USERNAME")
-MIS_PASSWORD = os.getenv("MIS_PASSWORD")
-MIS_HOST = "Bridge Live"
-MIS_DATABASE = "Bridge Live"
-
-MIS_EXPORT_DIR = DOWNLOAD_DIR / "MIS_Exports"
-MIS_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+# Direct DB connection replaces the earlier Playwright/Selenium browser
+# automation of the MIS export-query website (https://mis.authbridge.com/export_query/)
+# for pulling Advance Tracker / Case History / Sent Cases data. The MIS site's
+# "Host"/"Database" dropdowns were just display labels ("Bridge Live") over
+# this same underlying checkpoint_live schema — this connects to it directly
+# instead of driving the website's UI to run the same queries.
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 
 # =========================================================
@@ -557,9 +558,10 @@ def clean_latest_excel_file():
 # =========================================================
 # FUNCTION TO BUILD THE ARS NUMBER LIST FROM THE CLEANED FILE
 # =========================================================
-def get_ars_number_list():
-    """Read column C (ARS Number) of the cleaned tracker and build a quoted,
-    comma-separated list, e.g. 'ARS1','ARS2','ARS3' — equivalent to the AC column formula."""
+def get_ars_numbers():
+    """Read column C (ARS Number) of the cleaned tracker and return the raw list
+    of ARS number strings (used as bind parameters for the DB queries below —
+    no manual quoting needed, mysql-connector parameterizes the IN clause)."""
     cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
     if not cleaned_file_path.exists():
         return None, f"No {CLEANED_FILE_NAME} found. Run 'Clean Latest File' first."
@@ -575,190 +577,264 @@ def get_ars_number_list():
     if not ars_numbers:
         return None, "No ARS numbers found in column C"
 
-    return ",".join(f"'{ars}'" for ars in ars_numbers), None
+    return ars_numbers, None
 
 
-def _select_dropdown_option(page, name, option_matcher, timeout=30):
-    """Select an option in a <select name=...> that Autobridge's MIS tool rebuilds via
-    onchange handlers. Playwright locators re-resolve the DOM by selector on every call
-    (no held element handle), so there's no Selenium-style staleness to guard against —
-    this just polls the option text until the rebuild has produced a matching option.
+# =========================================================
+# DATABASE QUERY LAYER — REPLACES THE PLAYWRIGHT/MIS-WEBSITE AUTOMATION
+# =========================================================
+# The three queries below are exactly what the MIS export-query website ran
+# server-side for "Advance Tracker" / "Case History" / "Sent Cases" (its
+# Host/Database dropdowns were just display labels — "Bridge Live" — over
+# this same checkpoint_live schema). Querying the DB directly removes the
+# whole browser-automation layer (login, dropdown selection, Export-click,
+# CSV/zip download+parse) — same data, same column names, no browser.
+#
+# `check_id1` is the literal placeholder text from the site's own SQL (its
+# ARS-number-list substitution point) — kept verbatim rather than rewritten,
+# and swapped for a parameterized `%s,%s,...` IN-list at execute time via
+# _execute_ars_query() so ARS numbers are always bound as query parameters,
+# never string-interpolated into the SQL text.
+ADVANCE_TRACKER_QUERY = """
+SELECT ecc.Case_Check_id,case_ars_no,emc.Company_name,
+CONCAT(first_name,' ',IFNULL(middle_name,''),' ',IFNULL(last_name,'')) AS Candidate_name,
+Process_name,  received_date AS case_received_date,
+ecm.created_date AS case_created_date,
+ecff.CASE_FLEX_FIELD1,ecff.CASE_FLEX_FIELD2,ecff.CASE_FLEX_FIELD3,ecff.CASE_FLEX_FIELD4,
+ecff.CASE_FLEX_FIELD5,ecff.CASE_FLEX_FIELD6,ecff.CASE_FLEX_FIELD7,ecff.CASE_FLEX_FIELD8,
+ecff.CASE_FLEX_FIELD9,ecff.CASE_FLEX_FIELD10,ecff.CASE_FLEX_FIELD11,ecff.CASE_FLEX_FIELD12,
+ecff.CASE_FLEX_FIELD13,ecff.CASE_FLEX_FIELD14,ecff.CASE_FLEX_FIELD15,ecff.CASE_FLEX_FIELD16,
+ecff.CASE_FLEX_FIELD17,ecff.CASE_FLEX_FIELD18,ecff.CASE_FLEX_FIELD19,ecff.CASE_FLEX_FIELD20,
+ecff.CASE_FLEX_FIELD21,ecff.CASE_FLEX_FIELD22,ecff.CASE_FLEX_FIELD23,ecff.CASE_FLEX_FIELD24,
+ecff.CASE_FLEX_FIELD25,ecff.CASE_FLEX_FIELD26,ecff.CASE_FLEX_FIELD27,ecff.CASE_FLEX_FIELD28,
+ecff.CASE_FLEX_FIELD29,ecff.CASE_FLEX_FIELD30,
+checkpoint_live.fn_case_status(case_status) AS 'Case_status',
+checkpoint_live.fn_check_status(check_status) AS 'check_status',
+ec.check_name AS 'Check_unique_name',
+check_disposition_id,disposition_name,check_severity,
+REPLACE(ecc.closure_comments,'rn','') AS closure_comments,ecc.check_closure_date,
+ecc.insuff_remarks,
 
-    Verifies the selection actually stuck before returning, and retries the whole
-    selection if not. This matters specifically for csv_query (Query): re-selecting
-    access_time (Data Time Slab) — even to its already-selected value — silently
-    resets csv_query back to blank shortly afterward, without rebuilding its option
-    list. select_option() not raising an exception does NOT mean the selection
-    survived; confirmed live that selecting csv_query immediately after access_time
-    gets silently wiped, while doing the identical select_option() call after a
-    pause sticks. Don't drop this verification thinking it's redundant — it's the
-    fix for a real, reproduced site behavior, not defensive-programming padding."""
-    selector = f"select[name='{name}']"
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        try:
-            option_texts = page.locator(f"{selector} option").all_text_contents()
-            match = next((t for t in option_texts if option_matcher(t)), None)
-            if match is None:
-                time.sleep(0.3)
-                continue
-            page.select_option(selector, label=match)
-            time.sleep(0.5)
-            current_text = page.eval_on_selector(
-                selector,
-                "el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : null",
-            )
-            if current_text != match:
-                continue
-            return match
-        except Exception:
-            time.sleep(0.3)
-    raise TimeoutError(f"Timed out waiting for a matching option in <select name='{name}'>")
+@insuffdate:=(SELECT action_taken_on FROM ec_case_history ech WHERE ecc.case_check_id=ech.check_id
+AND action_taken in (' case Status changed to : Case Insufficient',
+' case Status changed to : InSufficient',
+'Insuff Raised',
+'Marked Insufficient',
+'Marked Insufficient (Parallel Research)',
+'New Status - Case Insufficient',
+'New Status - InSufficient',
+'Vendor request closed & Insuff raised',
+'Case Insufficient',
+'Check Created | Marked Insufficient',
+'Check Updated | Marked Insufficient',
+'New Status - Case Insuff Updated',
+'New Status - New Case | Case Insufficient',
+'Check Insuff raised',
+'Case level Insuff raised',
+'New Status - Case Insufficiency raised',
+'Insufficient - Rework on Report',
+'Insuff accepted' ) ORDER BY action_id LIMIT 1) AS 'First_Insuff_Date',
+
+ecc.insuff_fulfill_date,
+office_name location,
+IF(ecc.family_id=4,emei.institute_name,IF(ecc.family_id=5,emc1.company_name,emcy.city_name)) AS verification_source,
+ecm.case_expected_closure_date case_due_date,check_created_on,ecc.go_ahead_date,ecc.copy_of_check,
+
+IFNULL(ec.CHECK_OPS_NAME,LEFT(REPLACE(family_name,' Family',''),3)) AS 'Check Ops Name',
+
+ecc.reopen_date AS 'check_reopen_date',ecm.reopen_date AS 'case_reopen_date',
+checkpoint_live.fn_ver_summary(ecc.VER_SUMMARY) AS Ver_Summary,
+checkpoint_live.fn_ver_procedure(ecc.VERIFICATION_PROCEDURE) AS VERIFICATION_PROCEDURE,
+checkpoint_live.fn_check_sub_status(ecc.sub_status) AS 'Check Sub Status',
+(SELECT action_taken_on FROM ec_case_history ech
+WHERE ecc.case_check_id=ech.check_id AND action_taken='Insuff Qc Status Updateas'
+AND action_comments='Accepted' ORDER BY action_id DESC LIMIT 1) AS 'Inusff Accepted',
+
+(SELECT report_sent_on FROM ec_case_reports ecr WHERE ecr.case_id=ecm.case_id AND report_type=0 AND report_status=5 ORDER BY case_report_id DESC LIMIT 1) 'Last_Inerim_Report_Sent_Date',
+(SELECT report_severity FROM ec_case_reports ecr WHERE ecr.case_id=ecm.case_id AND report_type=0 AND report_status=5 ORDER BY case_report_id DESC LIMIT 1) 'Last_Inerim_Report_Severity',
+(SELECT report_sent_on FROM ec_case_reports ecr WHERE ecr.case_id=ecm.case_id AND report_type=1 AND report_status=5 ORDER BY case_report_id DESC LIMIT 1) 'Last_Final_Report_Sent_Date',
+(SELECT report_severity FROM ec_case_reports ecr WHERE ecr.case_id=ecm.case_id AND report_type=1 AND report_status=5 ORDER BY case_report_id DESC LIMIT 1) 'Last_Inerim_Report_Severity',
+dqc_released_date,
+(CASE TIER
+WHEN 0 THEN 'Overseas'
+WHEN 1 THEN 'Tier 1'
+WHEN 2 THEN 'Tier 2'
+WHEN 3 THEN 'Tier 3'
+WHEN 4 THEN 'Tier 4' END ) AS 'Tier',
+
+CONCAT(eud1.user_first_name,' ',eud1.user_last_name) AS 'DS Name',
+QUEUE_NAME,
+IF(@insuffdate is not null,if(@insuffdate<=dqc_released_date,'L1','L2'),'') AS 'Insuff Type',
+IF(@insuffdate is not null,if(check_status in (0,1,2,3,4,5,6,7,13),'WIP','Non-Wip'),'Others') AS 'Insuff WIP Type',
+PRIORITIZED_REQUESTED_EDC as 'EDC Prioritized Requested Date',
+PRIORITIZED_REVISED_EDC as 'EDC Prioritized Revised Date',
+if(ecc.check_status in (8,10,11,12),fn_user_name(VQC_REVIEWER_ID),'') as 'VQC done by',
+ecm.CLIENT_CASE_EXPECTED_CLOSURE_DATE
+
+FROM ec_case_master ecm
+LEFT JOIN ec_case_fields ecff ON ecm.case_id=ecff.case_id
+LEFT JOIN ec_case_checks ecc ON ecm.case_id = ecc.case_id
+LEFT JOIN ec_check_queues ecq ON ecc.check_queue=ecq.queue_id AND ecc.check_id=ecq.check_id
+LEFT JOIN ec_master_company emc ON emc.company_id = ecm.client_id
+LEFT JOIN ec_client_process ecp ON ecm.process_id=ecp.process_id
+LEFT JOIN ec_case_candidates ecc1 ON ecc1.candidate_id=ecm.candidate_id
+LEFT JOIN ec_master_company_locations emcl ON ecm.client_office_id=emcl.office_id
+LEFT JOIN ec_user_details eud ON ecc.check_verifier=eud.user_id
+LEFT JOIN ec_user_details eud1 ON ecm.documented_by=eud1.user_id
+LEFT JOIN ec_case_check_verification_source eccvs ON ecc.case_check_id=eccvs.case_check_id
+LEFT JOIN ec_master_company emc1 ON eccvs.org_id=emc1.company_id
+LEFT JOIN ec_master_educational_institute emei ON eccvs.org_id=emei.institute_id
+LEFT JOIN ec_master_city emcy ON emcy.city_id=eccvs.org_id
+LEFT JOIN ec_master_state ems ON emcy.state_id=ems.state_id
+LEFT JOIN ec_checks ec ON ecc.check_id=ec.check_id
+left join ec_check_families ecf on ec.family_id=ecf.family_id
+LEFT JOIN ec_master_disposition emd ON ecc.check_disposition_id=emd.disposition_id
+WHERE case_status NOT IN (8,14)
+AND check_status <> 9
+and ecc.check_id<>193
+AND ecm.case_ars_no IN  (check_id1)
+"""
+
+CASE_HISTORY_QUERY = """
+SELECT company_name CLIENT,case_ars_no,check_name,(CASE check_status
+WHEN '0' THEN 'Documentation Pending'
+WHEN '1' THEN 'New/UnAssigned'
+WHEN '2' THEN 'On Hold'
+WHEN '3' THEN 'Insufficient'
+WHEN '4' THEN 'Work in Progress'
+WHEN '5' THEN 'Awaiting Response'
+WHEN '6' THEN 'Escalated'
+WHEN '7' THEN 'In Research'
+WHEN '8' THEN 'Completed'
+WHEN '9' THEN 'Disabled'
+WHEN '10' THEN 'case closed by client'
+WHEN '11' THEN 'Closed with Insufficiency'
+WHEN '12' THEN 'Closed-Case Insufficient'
+WHEN '13' THEN 'Contractually on Hold'END) AS 'check_status',check_severity,CONCAT(user_first_name,' ',user_last_name) AS action_taken_by, IF(eud.reporting_to IN (70,34,79,650),'insuff raised by PVT','insuff raised by other department') AS insuff_raised_by,designation,ech.*
+FROM ec_case_history ech
+LEFT JOIN ec_case_checks ecc ON  ech.check_id=ecc.case_check_id
+LEFT JOIN ec_case_master ecm ON ech.case_id=ecm.case_id
+LEFT JOIN ec_master_company emc ON ecm.client_id=emc.company_id
+LEFT JOIN ec_user_details eud ON ech.action_taken_by=eud.user_id
+WHERE case_ars_no in (check_id1)
+"""
+
+SENT_CASES_QUERY = """
+SELECT ecr.case_report_id,company_name AS Client_name,
+CONCAT(ifnull(first_name,''),' ',ifnull(Middle_name,''),' ',ifnull(Last_name,'')) Candidate_name,
+Process_name,office_name location,case_ars_no,received_date,ecm.created_date,requested_on,ecm.case_expected_closure_date,
+ecf3.case_flex_field1,ecf3.case_flex_field2,ecf3.case_flex_field3,
+ecf3.case_flex_field4,ecf3.case_flex_field5,ecf3.case_flex_field6,
+report_delivery_date, report_sent_on,
+(CASE report_type
+WHEN '0' THEN 'Interim'
+WHEN '1' THEN 'Final'
+WHEN '2' THEN 'Additional' END) AS 'Report Type',
+report_severity, CONCAT(User_first_name,' ',User_last_name) PS,
+(CASE report_status
+WHEN 1 THEN 'New'
+WHEN 2 THEN 'Assigned'
+WHEN 3 THEN 'Verified'
+WHEN 4 THEN 'Sent for Rework'
+WHEN 5 THEN 'sent'
+WHEN 6 THEN 'Reworked'
+WHEN 7 THEN 'Not Sent'
+WHEN 8 THEN 'Report Generation Pending'
+WHEN 9 THEN 'Report Generation Failed'
+WHEN 10 THEN 'Report Email Auto Triggered'
+WHEN 11 THEN 'Report Email Sending Process Failed' END) AS 'Report Status',
+CASE_ACCEPTED_DATE,ecr.requested_on report_triggered_on,spoc_comments cat_comments,
+REVIEW_COMMENTS as 'ps comments',REVIEW_DATETIME as 'ps comment on',
+SPOC_COMMENTS as cat_comments,CLIENT_CASE_EXPECTED_CLOSURE_DATE
+FROM ec_case_reports ecr
+LEFT JOIN ec_case_master ecm ON  ecr.case_id=ecm.case_id
+LEFT JOIN ec_case_candidates ec ON ec.candidate_id=ecm.candidate_id
+LEFT JOIN ec_master_company emc ON ecr.CLIENT_ID = emc.COMPANY_ID
+LEFT JOIN ec_user_details eud ON ecr.assigned_to=eud.user_id
+LEFT JOIN ec_client_process ecp ON ecm.process_id=ecp.process_id
+LEFT JOIN ec_master_company_locations emcl ON ecm.client_office_id=emcl.office_id
+LEFT JOIN ec_case_fields ecf3 ON ecm.case_id=ecf3.case_id
+WHERE  ecm.case_ars_no in (check_id1)
+"""
 
 
-def select_query(page, data_time_slab_keyword, query_name):
-    """Change the Data Time Slab / Query selection on an already-logged-in MIS session."""
-    _select_dropdown_option(
-        page, "access_time", lambda t: data_time_slab_keyword.lower() in t.lower()
+def get_db_connection():
+    """Open a fresh connection to the live checkpoint_live MySQL DB (RDS).
+    Each of the 3 ARS queries below opens, executes, and closes its own
+    connection rather than sharing one long-lived session — mirrors how the
+    old Playwright flow made 3 independent requests in one browser session,
+    without needing to keep a DB connection alive across the whole Streamlit
+    button-click lifecycle."""
+    return mysql.connector.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
     )
-    _select_dropdown_option(page, "csv_query", lambda t: t == query_name)
 
 
-def fill_ars_number_field(page, ars_list, timeout=30):
-    """Paste the ARS number list into the ARS No* field for the currently selected query.
-    page.fill() re-locates by selector and auto-waits for the element to be actionable,
-    which already covers the query tool rebuilding this field's containing table via JS
-    whenever the Query dropdown changes — no manual staleness retry needed, unlike Selenium."""
-    selector = "xpath=//*[@id='date']/tbody/tr[2]/td[2]/input"
-    page.fill(selector, ars_list, timeout=timeout * 1000)
+def _execute_ars_query(sql_template, ars_numbers, extra_where=None, extra_params=()):
+    """Run one of the *_QUERY templates above against checkpoint_live,
+    substituting `check_id1` for a parameterized `%s,%s,...` IN-list bound to
+    ars_numbers (never string-interpolated). Returns (header, data_rows, error)
+    — header is the list of column names from cursor.description, data_rows a
+    list of tuples — the same (header, rows) shape the old CSV-export parsing
+    used to hand back, so every downstream add_*_sheet function below needs
+    only to accept rows directly instead of a file path, not a logic rewrite.
 
-
-# =========================================================
-# FUNCTION TO LOG INTO THE MIS EXPORT QUERY TOOL AND NAVIGATE TO A QUERY
-# =========================================================
-def run_ars_query(data_time_slab_keyword, query_name):
-    """Log into the MIS export tool and select Host/Database/Data Time Slab/Query.
-    Returns a Playwright Page with the browser left open on the query form.
-
-    Uses playwright.sync_api.sync_playwright().start() rather than the
-    `with sync_playwright() as p:` context-manager form deliberately: exiting
-    that `with` block tears down the driver connection and closes the browser,
-    but per an explicit prior user request the browser must stay open after
-    this function returns (so it can be reviewed / reused for later queries
-    on the same session) — so .stop()/.close() are never called here, mirroring
-    the old Selenium code's "never call driver.quit()" behavior.
-
-    Resets the asyncio event loop policy to WindowsProactorEventLoopPolicy
-    before starting Playwright. Streamlit is built on Tornado, which forces
-    the process-wide policy to WindowsSelectorEventLoopPolicy on Windows —
-    but SelectorEventLoop can't spawn subprocesses on Windows, and Playwright's
-    sync API needs to spawn its driver subprocess, so calling this from inside
-    a running Streamlit app raises NotImplementedError from deep inside
-    asyncio's subprocess machinery (confirmed by reproducing it directly: the
-    exact same traceback occurs by just forcing WindowsSelectorEventLoopPolicy
-    outside of Streamlit too). This is why the exact same code always worked
-    when run as a standalone script (default policy is Proactor there) but
-    always failed through the Streamlit UI."""
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    playwright = sync_playwright().start()
-    # channel="chrome" launches the real installed Chrome binary rather than
-    # Playwright's own bundled Chromium. This isn't cosmetic: on this network,
-    # the bundled Chromium gets net::ERR_CONNECTION_CLOSED hitting the MIS
-    # site (confirmed: curl and a real Chrome instance both reach it fine,
-    # the bundled binary alone was blocked) — some corporate proxy/security
-    # layer is evidently allowing the recognized Chrome executable through
-    # while blocking the unrecognized one. Don't drop this thinking it's
-    # unnecessary.
-    browser = playwright.chromium.launch(
-        headless=False, channel="chrome", args=["--start-maximized"]
-    )
-    context = browser.new_context(accept_downloads=True, no_viewport=True)
-    page = context.new_page()
-    page.set_default_timeout(30_000)
-    # Login/query pages here are ordinary navigations, not downloads, so a
-    # generous but bounded navigation timeout is safe (unlike Export's click,
-    # handled separately in export_and_download via expect_download()).
-    page.set_default_navigation_timeout(90_000)
-
-    page.goto(MIS_LOGIN_URL)
-
-    page.fill("xpath=//input[@type='text']", MIS_USERNAME)
-    page.fill("xpath=//input[@type='password']", MIS_PASSWORD)
-    page.click("xpath=//input[@value='Login']")
-
-    _select_dropdown_option(page, "hostname", lambda t: t == MIS_HOST)
-    _select_dropdown_option(page, "database", lambda t: t == MIS_DATABASE)
-    select_query(page, data_time_slab_keyword, query_name)
-
-    return page
-
-
-# =========================================================
-# FUNCTION TO CLICK EXPORT AND WAIT FOR THE DOWNLOAD TO COMPLETE
-# =========================================================
-def export_and_download(page, timeout=120):
-    """Click the Export button and save the resulting download into MIS_EXPORT_DIR.
-    Returns (file_path, error).
-
-    Uses page.expect_download() rather than clicking then polling the filesystem
-    (the old Selenium approach). That polling approach had a real bug: Selenium's
-    .click() on a form-submit button blocks until the browser reports the
-    resulting navigation complete, and a slow server-side report generation could
-    hang that single .click() call itself for minutes — well before our own
-    polling loop even started, since it only began counting after .click()
-    returned. It surfaced as a raw, uncatchable "Read timed out (120)" from the
-    underlying HTTP client. expect_download() sidesteps this entirely: it listens
-    for the browser's actual download event directly, decoupled from whatever
-    Chrome's navigation/page-load state is doing."""
-    selector = "xpath=/html/body/div/div/div[2]/form/input"
+    `extra_where`, if given, is appended as `AND (<extra_where>)` onto the
+    query's existing WHERE clause (each *_QUERY template's WHERE is its last
+    clause, with nothing after it, so straight string concatenation is safe)
+    — used to push a filter down to the DB instead of fetching every row and
+    filtering in Python. Deliberately NOT done by wrapping the query in a
+    `SELECT * FROM (...) t WHERE ...` derived table: CASE_HISTORY_QUERY's own
+    SELECT list has two columns that collide case-insensitively (`action_taken_by`
+    or the explicit alias, `ACTION_TAKEN_BY` from `ech.*`), which MySQL accepts
+    in a flat result set but rejects when materializing a derived table
+    (`1060: Duplicate column name 'ACTION_TAKEN_BY'`, confirmed live). Flat
+    string concatenation onto the existing WHERE has no such restriction.
+    `extra_params` are appended after `ars_numbers` in the bound parameter
+    list, in the same order their `%s` placeholders appear in `extra_where`."""
+    placeholders = ",".join(["%s"] * len(ars_numbers))
+    query = sql_template.replace("check_id1", placeholders)
+    if extra_where:
+        query = f"{query.rstrip()}\nAND ({extra_where})"
+    params = list(ars_numbers) + list(extra_params)
 
     try:
-        page.wait_for_selector(selector, timeout=30_000)
-    except PlaywrightTimeoutError:
-        # Distinguishes "never found the button" from "clicked it, no
-        # download followed" below — both used to raise the exact same
-        # PlaywrightTimeoutError from inside one shared try/except, making
-        # "Export clicked but no download..." a misleading message when the
-        # click never actually happened.
-        return None, "Could not find the Export button within 30s"
+        conn = get_db_connection()
+    except MySQLError as e:
+        return None, None, f"Database connection error: {e}"
 
     try:
-        with page.expect_download(timeout=timeout * 1000) as download_info:
-            page.click(selector)
-        download = download_info.value
-    except PlaywrightTimeoutError:
-        return None, "Export clicked but no download completed within the timeout"
-
-    dest_path = MIS_EXPORT_DIR / download.suggested_filename
-    if dest_path.exists():
-        # Repeated exports in the same session (e.g. re-running a query) can
-        # reuse the same suggested filename — de-duplicate like Chrome does
-        # for plain downloads, rather than overwriting the earlier file.
-        stem, suffix = dest_path.stem, dest_path.suffix
-        counter = 1
-        while dest_path.exists():
-            dest_path = MIS_EXPORT_DIR / f"{stem} ({counter}){suffix}"
-            counter += 1
-    download.save_as(str(dest_path))
-
-    return dest_path, None
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        header = [desc[0] for desc in cursor.description]
+        data_rows = cursor.fetchall()
+        cursor.close()
+        return header, data_rows, None
+    except MySQLError as e:
+        return None, None, f"Database query error: {e}"
+    finally:
+        conn.close()
 
 
-# =========================================================
-# FUNCTION TO READ THE EXPORTED CSV (PLAIN OR ZIPPED)
-# =========================================================
-def _read_export_csv_rows(export_file_path):
-    """Return all rows (including header) from the exported Advance Tracker file,
-    whether it downloaded as a plain .csv or a .csv.zip."""
-    if export_file_path.suffix.lower() == ".zip":
-        with zipfile.ZipFile(export_file_path) as zf:
-            csv_name = next(name for name in zf.namelist() if name.lower().endswith(".csv"))
-            with zf.open(csv_name) as f:
-                text = f.read().decode("utf-8", errors="replace")
-    else:
-        text = export_file_path.read_text(encoding="utf-8", errors="replace")
+def _excel_safe(value):
+    """Convert a DB-native value into something openpyxl can write directly.
+    decimal.Decimal (returned for DECIMAL/NUMERIC columns) isn't one of
+    openpyxl's accepted cell types and raises on assignment — everything else
+    (str/int/float/date/datetime/None) is already safe as-is."""
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
 
-    return list(csv.reader(io.StringIO(text)))
+
+def _none_first_sort_key(value):
+    """Sort key for a column that may hold a real date/datetime or None —
+    plain `sorted()` raises TypeError comparing None to a datetime, so this
+    sorts blanks first instead of erroring."""
+    return (value is None, value)
 
 
 # =========================================================
@@ -774,25 +850,25 @@ RED_REMARKS_CHECK_NAMES = {
 }
 
 
-def add_red_remarks_sheet(export_file_path):
-    """Filter the exported Advance Tracker data to check_severity in
+def add_red_remarks_sheet(wb, header, data_rows):
+    """Filter the Advance Tracker query results to check_severity in
     RED_REMARKS_SEVERITIES AND Check_unique_name in RED_REMARKS_CHECK_NAMES,
     then group by case_ars_no and join each ARS's closure_comments with ", "
     into a single row per unique ARS. Writes case_ars_no (column B) ->
     combined closure_comments (column C) into a new 'red remarks' sheet in
     the cleaned tracker — verified against a real export to reproduce the
-    expected combined-comment text exactly (e.g. ARS 3055-016865)."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return None, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
+    expected combined-comment text exactly (e.g. ARS 3055-016865).
 
-    rows = _read_export_csv_rows(export_file_path)
-    header, data_rows = rows[0], rows[1:]
-
+    Takes an already-open Workbook (`wb`) rather than opening/saving its own
+    copy of the file — see the "single load/save pass" note on the button
+    handler below for why: opening and saving this file separately per
+    function meant 6 full load+parse+save round trips per run on a workbook
+    that can hold tens of thousands of audit-sheet rows, which dominated this
+    step's wall-clock time far more than the DB queries themselves."""
     required = ["check_severity", "Check_unique_name", "case_ars_no", "closure_comments"]
     missing = [c for c in required if c not in header]
     if missing:
-        return None, f"Column(s) {', '.join(missing)} not found in the exported file"
+        return None, f"Column(s) {', '.join(missing)} not found in the query result"
 
     sev_col = header.index("check_severity")
     name_col = header.index("Check_unique_name")
@@ -802,9 +878,7 @@ def add_red_remarks_sheet(export_file_path):
     filtered_rows = [
         row
         for row in data_rows
-        if len(row) > comment_col
-        and row[sev_col] in RED_REMARKS_SEVERITIES
-        and row[name_col] in RED_REMARKS_CHECK_NAMES
+        if row[sev_col] in RED_REMARKS_SEVERITIES and row[name_col] in RED_REMARKS_CHECK_NAMES
     ]
 
     comments_by_ars = {}
@@ -813,7 +887,6 @@ def add_red_remarks_sheet(export_file_path):
             continue
         comments_by_ars.setdefault(row[ars_col], []).append(row[comment_col])
 
-    wb = load_workbook(cleaned_file_path)
     sheet_name = "red remarks"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -831,8 +904,6 @@ def add_red_remarks_sheet(export_file_path):
             f"=IFERROR(VLOOKUP(C{row},'red remarks'!B:AB,2,0),\"\")"
         )
 
-    wb.save(cleaned_file_path)
-
     return len(comments_by_ars), None
 
 
@@ -844,31 +915,21 @@ FORM_SUBMISSION_L2_COMMENT = (
 )
 
 
-def add_form_submission_l2_sheet(export_file_path):
-    """Filter the exported Case History data to ACTION_COMMENTS matching the
+def add_form_submission_l2_sheet(wb, header, data_rows):
+    """Filter the Case History query results to ACTION_COMMENTS matching the
     L2 form-submission comment, sort by ACTION_TAKEN_ON oldest-first, and copy
-    the full matching rows into a 'Form submisison - L2' sheet in the cleaned tracker."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return None, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
-
-    rows = _read_export_csv_rows(export_file_path)
-    header, data_rows = rows[0], rows[1:]
-
+    the full matching rows into a 'Form submisison - L2' sheet in the cleaned
+    tracker. Takes an already-open Workbook — see add_red_remarks_sheet's
+    docstring for why."""
     if "ACTION_COMMENTS" not in header or "ACTION_TAKEN_ON" not in header:
-        return None, "Column 'ACTION_COMMENTS' or 'ACTION_TAKEN_ON' not found in the exported file"
+        return None, "Column 'ACTION_COMMENTS' or 'ACTION_TAKEN_ON' not found in the query result"
 
     comments_col = header.index("ACTION_COMMENTS")
     taken_on_col = header.index("ACTION_TAKEN_ON")
 
-    filtered_rows = [
-        row
-        for row in data_rows
-        if len(row) > comments_col and row[comments_col] == FORM_SUBMISSION_L2_COMMENT
-    ]
-    filtered_rows.sort(key=lambda row: row[taken_on_col] if len(row) > taken_on_col else "")
+    filtered_rows = [row for row in data_rows if row[comments_col] == FORM_SUBMISSION_L2_COMMENT]
+    filtered_rows.sort(key=lambda row: _none_first_sort_key(row[taken_on_col]))
 
-    wb = load_workbook(cleaned_file_path)
     sheet_name = "Form submisison - L2"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -876,7 +937,7 @@ def add_form_submission_l2_sheet(export_file_path):
 
     ws.append(header)
     for row in filtered_rows:
-        ws.append(row)
+        ws.append([_excel_safe(v) for v in row])
 
     tracker_ws = wb["Pre_Offer_checkwise"]
     tracker_ws["X2"] = "Form submisison - L2"
@@ -884,8 +945,6 @@ def add_form_submission_l2_sheet(export_file_path):
         tracker_ws[f"X{row}"] = (
             f"=IFERROR(VLOOKUP(C{row},'Form submisison - L2'!B:T,12,0),\"\")"
         )
-
-    wb.save(cleaned_file_path)
 
     return len(filtered_rows), None
 
@@ -896,29 +955,21 @@ def add_form_submission_l2_sheet(export_file_path):
 CASE_REOPENED_ACTION = "New Status - Case Reopened"
 
 
-def add_l2_check_addition_oldest_sheet(export_file_path):
-    """Filter the exported Case History data to ACTION_TAKEN == 'New Status - Case
+def add_l2_check_addition_oldest_sheet(wb, header, data_rows):
+    """Filter the Case History query results to ACTION_TAKEN == 'New Status - Case
     Reopened', sort by ACTION_TAKEN_ON oldest-first, and copy the full matching
-    rows into a 'L2 check addition (Oldest)' sheet in the cleaned tracker."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return None, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
-
-    rows = _read_export_csv_rows(export_file_path)
-    header, data_rows = rows[0], rows[1:]
-
+    rows into a 'L2 check addition (Oldest)' sheet in the cleaned tracker.
+    Takes an already-open Workbook — see add_red_remarks_sheet's docstring
+    for why."""
     if "ACTION_TAKEN" not in header or "ACTION_TAKEN_ON" not in header:
-        return None, "Column 'ACTION_TAKEN' or 'ACTION_TAKEN_ON' not found in the exported file"
+        return None, "Column 'ACTION_TAKEN' or 'ACTION_TAKEN_ON' not found in the query result"
 
     action_col = header.index("ACTION_TAKEN")
     taken_on_col = header.index("ACTION_TAKEN_ON")
 
-    filtered_rows = [
-        row for row in data_rows if len(row) > action_col and row[action_col] == CASE_REOPENED_ACTION
-    ]
-    filtered_rows.sort(key=lambda row: row[taken_on_col] if len(row) > taken_on_col else "")
+    filtered_rows = [row for row in data_rows if row[action_col] == CASE_REOPENED_ACTION]
+    filtered_rows.sort(key=lambda row: _none_first_sort_key(row[taken_on_col]))
 
-    wb = load_workbook(cleaned_file_path)
     sheet_name = "L2 check addition (Oldest)"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -926,7 +977,7 @@ def add_l2_check_addition_oldest_sheet(export_file_path):
 
     ws.append(header)
     for row in filtered_rows:
-        ws.append(row)
+        ws.append([_excel_safe(v) for v in row])
 
     tracker_ws = wb["Pre_Offer_checkwise"]
     tracker_ws["Y2"] = "L2 check addition (Oldest)"
@@ -934,8 +985,6 @@ def add_l2_check_addition_oldest_sheet(export_file_path):
         tracker_ws[f"Y{row}"] = (
             f"=IFERROR(VLOOKUP(C{row},'L2 check addition (Oldest)'!B:T,12,0),\"\")"
         )
-
-    wb.save(cleaned_file_path)
 
     return len(filtered_rows), None
 
@@ -957,8 +1006,8 @@ def _find_header_col_letter(ws, header_name, header_row=2):
     return None
 
 
-def add_l2_report_sent_sheet(export_file_path):
-    """Filter the exported Sent Cases data to Report Status == 'Sent' and
+def add_l2_report_sent_sheet(wb, header, data_rows):
+    """Filter the Sent Cases query results to Report Status == 'Sent' and
     Report Type == 'Additional', sort by report_sent_on oldest-first, and copy
     the full matching rows into a 'L2 Report Sent' sheet in the cleaned tracker.
     Overwrites the existing 'L2 Report sent date' / 'L2 Report sent severity'
@@ -967,20 +1016,15 @@ def add_l2_report_sent_sheet(export_file_path):
     (date-only, dd-mmm-yy, for the date column).
 
     Uses INDEX/MATCH rather than VLOOKUP for the mapping formulas: unlike the
-    other export-derived sheets here, the relative position of case_ars_no vs.
-    report_sent_on/report_severity in the Sent Cases export hasn't been verified
-    against a live file, and VLOOKUP can't look left of its lookup column."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return None, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
-
-    rows = _read_export_csv_rows(export_file_path)
-    header, data_rows = rows[0], rows[1:]
-
+    other query-derived sheets here, the relative position of case_ars_no vs.
+    report_sent_on/report_severity in the Sent Cases result hasn't been verified
+    against a live file, and VLOOKUP can't look left of its lookup column.
+    Takes an already-open Workbook — see add_red_remarks_sheet's docstring
+    for why."""
     required = ["Report Status", "Report Type", "report_sent_on", "case_ars_no", "report_severity"]
     missing = [c for c in required if c not in header]
     if missing:
-        return None, f"Column(s) {', '.join(missing)} not found in the exported file"
+        return None, f"Column(s) {', '.join(missing)} not found in the query result"
 
     status_col = header.index("Report Status")
     type_col = header.index("Report Type")
@@ -991,13 +1035,11 @@ def add_l2_report_sent_sheet(export_file_path):
     filtered_rows = [
         row
         for row in data_rows
-        if len(row) > max(status_col, type_col)
-        and row[status_col].strip().lower() == REPORT_SENT_STATUS.lower()
-        and row[type_col].strip().lower() == REPORT_SENT_TYPE.lower()
+        if (row[status_col] or "").strip().lower() == REPORT_SENT_STATUS.lower()
+        and (row[type_col] or "").strip().lower() == REPORT_SENT_TYPE.lower()
     ]
-    filtered_rows.sort(key=lambda row: row[sent_on_col] if len(row) > sent_on_col else "")
+    filtered_rows.sort(key=lambda row: _none_first_sort_key(row[sent_on_col]))
 
-    wb = load_workbook(cleaned_file_path)
     sheet_name = "L2 Report Sent"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -1005,17 +1047,21 @@ def add_l2_report_sent_sheet(export_file_path):
 
     ws.append(header)
     for row in filtered_rows:
-        ws.append(row)
+        ws.append([_excel_safe(v) for v in row])
 
-    # Reparse report_sent_on into a real date (date-only) in the audit sheet so
-    # the INDEX/MATCH pull-through below carries an actual date value, not text
-    # — the exported value is a full datetime string, and the destination's
-    # dd-mmm-yy number format only applies to real date-typed values.
+    # Reduce report_sent_on to a real date (date-only) in the audit sheet so
+    # the INDEX/MATCH pull-through below carries an actual date value, not a
+    # datetime with a time component — the destination's dd-mmm-yy number
+    # format needs a date-typed value, and the query returns a full datetime.
     sent_on_letter = get_column_letter(sent_on_col + 1)
     for i, row in enumerate(filtered_rows, start=2):
-        raw_value = row[sent_on_col] if len(row) > sent_on_col else ""
+        raw_value = row[sent_on_col]
         parsed_date = None
-        if raw_value:
+        if isinstance(raw_value, datetime):
+            parsed_date = raw_value.date()
+        elif isinstance(raw_value, date):
+            parsed_date = raw_value
+        elif isinstance(raw_value, str) and raw_value.strip():
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
                 try:
                     parsed_date = datetime.strptime(raw_value.strip(), fmt).date()
@@ -1052,8 +1098,6 @@ def add_l2_report_sent_sheet(export_file_path):
             f"MATCH(C{row},'{sheet_name}'!{ars_letter}:{ars_letter},0)),\"\")"
         )
 
-    wb.save(cleaned_file_path)
-
     return len(filtered_rows), None
 
 
@@ -1064,7 +1108,7 @@ CASE_STATUS_TARGETS = {"Insufficient", "On Hold"}
 CASE_STATUS_COMPLETED = "Completed"
 
 
-def update_case_status_from_l2_report_sent():
+def update_case_status_from_l2_report_sent(wb):
     """For Pre_Offer_checkwise rows whose Case Status (K) is currently
     'Insufficient' or 'On Hold', overwrite it to 'Completed' if that row's
     ARS number has a non-blank L2 Report sent date; otherwise leave it as-is.
@@ -1079,12 +1123,8 @@ def update_case_status_from_l2_report_sent():
     currently holds, and a formula can't reference its own cell's prior
     value. Naturally idempotent across repeat runs — once a row is flipped to
     'Completed' it no longer matches CASE_STATUS_TARGETS, so later runs (even
-    if the L2 Report Sent data changes) never touch it again."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return None, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
-
-    wb = load_workbook(cleaned_file_path)
+    if the L2 Report Sent data changes) never touch it again. Takes an
+    already-open Workbook — see add_red_remarks_sheet's docstring for why."""
     if "L2 Report Sent" not in wb.sheetnames:
         return None, "'L2 Report Sent' sheet not found. Run the Sent Cases query first."
 
@@ -1118,15 +1158,13 @@ def update_case_status_from_l2_report_sent():
             status_cell.value = CASE_STATUS_COMPLETED
             updated_count += 1
 
-    wb.save(cleaned_file_path)
-
     return updated_count, None
 
 
 # =========================================================
 # FUNCTION TO ADD L2 DUE DATE / L2 TAT / L2 CHECK STATUS COLUMNS
 # =========================================================
-def add_l2_summary_columns():
+def add_l2_summary_columns(wb):
     """Add 'L2 Due Date' (Z), 'L2 TAT' (AA), and 'L2 check status' (AB) columns to
     Pre_Offer_checkwise. Z is derived from X ('Form submisison - L2', added by
     add_form_submission_l2_sheet) via WORKDAY.INTL against the 'a' named range
@@ -1135,12 +1173,8 @@ def add_l2_summary_columns():
     (Oldest)', added by add_l2_check_addition_oldest_sheet — an independent
     lookup from X, not derived from it, unlike Z), U, and K ('Case Status').
     Must run after add_form_submission_l2_sheet (X), add_l2_check_addition_oldest_sheet
-    (Y), and clean_latest_excel_file (the 'a' named range)."""
-    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
-    if not cleaned_file_path.exists():
-        return False, f"{CLEANED_FILE_NAME} not found. Run 'Clean Latest File' first."
-
-    wb = load_workbook(cleaned_file_path)
+    (Y), and clean_latest_excel_file (the 'a' named range). Takes an
+    already-open Workbook — see add_red_remarks_sheet's docstring for why."""
     ws = wb["Pre_Offer_checkwise"]
 
     ws["Z2"] = "L2 Due Date"
@@ -1159,8 +1193,6 @@ def add_l2_summary_columns():
             f'IF(AND(X{row}="",Y{row}<>""),"Pending at candidate",'
             f'IF(X{row}<>"","Work In Progress","")))'
         )
-
-    wb.save(cleaned_file_path)
 
     return True, None
 
@@ -1678,63 +1710,85 @@ list_downloaded_files()
 
 
 st.markdown("---")
-st.subheader("Step 3: Run ARS Query in MIS")
+st.subheader("Step 3: Run ARS Query")
 st.caption(
-    "Opens the MIS export tool, logs in, and runs Advance Tracker, Case History, "
-    "and Sent Cases queries with the ARS numbers"
+    "Queries the checkpoint_live database directly for Advance Tracker, Case "
+    "History, and Sent Cases data for the ARS numbers — no browser involved"
 )
 
-if st.button("🔎 Run ARS Query in MIS", type="primary", use_container_width=True):
-    ars_list, error = get_ars_number_list()
+if st.button("🔎 Run ARS Query", type="primary", use_container_width=True):
+    ars_numbers, error = get_ars_numbers()
+    cleaned_file_path = DOWNLOAD_DIR / CLEANED_FILE_NAME
 
     if error:
         st.error(error)
     else:
-        with st.spinner("Logging into MIS and navigating to Advance Tracker..."):
-            try:
-                page = run_ars_query("Case Query", "Advance Tracker")
-                fill_ars_number_field(page, ars_list)
-                st.success(f"Pasted {ars_list.count(',') + 1} ARS number(s) into the query form")
+        try:
+            with st.spinner("Querying Advance Tracker..."):
+                adv_header, adv_rows, adv_error = _execute_ars_query(
+                    ADVANCE_TRACKER_QUERY, ars_numbers
+                )
+            if adv_error:
+                st.error(adv_error)
+            else:
+                st.success(f"Fetched {len(adv_rows)} Advance Tracker row(s) for {len(ars_numbers)} ARS number(s)")
 
-                downloaded_file, download_error = export_and_download(page)
-                if downloaded_file:
-                    st.success(f"Exported: {downloaded_file.name}")
+            # Case History is pushed a server-side filter for the only two
+            # conditions any downstream sheet actually uses (ACTION_COMMENTS
+            # == the L2 form-submission comment, or ACTION_TAKEN == the case
+            # reopened action) instead of fetching every row and filtering in
+            # Python. Verified against the live DB to return byte-identical
+            # rows either way, while cutting a 591K-row/16s fetch down to
+            # ~16K rows/<1s at production scale — see CLAUDE.md.
+            with st.spinner("Querying Case History..."):
+                ch_header, ch_rows, ch_error = _execute_ars_query(
+                    CASE_HISTORY_QUERY,
+                    ars_numbers,
+                    extra_where="ech.ACTION_COMMENTS = %s OR ech.ACTION_TAKEN = %s",
+                    extra_params=[FORM_SUBMISSION_L2_COMMENT, CASE_REOPENED_ACTION],
+                )
+            if ch_error:
+                st.error(ch_error)
+            else:
+                st.success(f"Fetched {len(ch_rows)} relevant Case History row(s)")
 
-                    with st.spinner("Filtering 'Major Discrepancy' rows into 'red remarks' tab..."):
-                        red_remarks_count, red_remarks_error = add_red_remarks_sheet(downloaded_file)
+            with st.spinner("Querying Sent Cases..."):
+                sc_header, sc_rows, sc_error = _execute_ars_query(SENT_CASES_QUERY, ars_numbers)
+            if sc_error:
+                st.error(sc_error)
+            else:
+                st.success(f"Fetched {len(sc_rows)} Sent Cases row(s)")
 
+            # One load/mutate/save pass instead of a separate open+save per
+            # step — opening and saving this workbook 6 separate times (once
+            # per add_*_sheet/update/summary call) dominated this button's
+            # wall-clock time far more than the DB queries themselves once
+            # Case History is filtered server-side. See each function's
+            # docstring for why it now takes `wb` instead of opening its own.
+            with st.spinner("Writing results into the tracker..."):
+                wb = load_workbook(cleaned_file_path)
+
+                if not adv_error:
+                    red_remarks_count, red_remarks_error = add_red_remarks_sheet(
+                        wb, adv_header, adv_rows
+                    )
                     if red_remarks_error:
                         st.error(red_remarks_error)
                     else:
                         st.success(
                             f"Added 'red remarks' tab with {red_remarks_count} Major Discrepancy row(s)"
                         )
-                else:
-                    st.warning(download_error)
 
-                with st.spinner("Navigating to Case History and pasting ARS numbers..."):
-                    select_query(page, "Case Query", "Case History")
-                    fill_ars_number_field(page, ars_list)
-
-                case_history_file, case_history_error = export_and_download(page)
-                if case_history_file:
-                    st.success(f"Exported: {case_history_file.name}")
-
-                    with st.spinner("Filtering & sorting into 'Form submisison - L2' tab..."):
-                        l2_count, l2_error = add_form_submission_l2_sheet(case_history_file)
-
+                if not ch_error:
+                    l2_count, l2_error = add_form_submission_l2_sheet(wb, ch_header, ch_rows)
                     if l2_error:
                         st.error(l2_error)
                     else:
-                        st.success(
-                            f"Added 'Form submisison - L2' tab with {l2_count} row(s)"
-                        )
+                        st.success(f"Added 'Form submisison - L2' tab with {l2_count} row(s)")
 
-                    with st.spinner("Filtering & sorting into 'L2 check addition (Oldest)' tab..."):
-                        reopened_count, reopened_error = add_l2_check_addition_oldest_sheet(
-                            case_history_file
-                        )
-
+                    reopened_count, reopened_error = add_l2_check_addition_oldest_sheet(
+                        wb, ch_header, ch_rows
+                    )
                     if reopened_error:
                         st.error(reopened_error)
                     else:
@@ -1742,23 +1796,8 @@ if st.button("🔎 Run ARS Query in MIS", type="primary", use_container_width=Tr
                             f"Added 'L2 check addition (Oldest)' tab with {reopened_count} row(s)"
                         )
 
-                else:
-                    st.warning(case_history_error)
-
-                with st.spinner("Navigating to Sent Cases and pasting ARS numbers..."):
-                    select_query(page, "Case Query", "Sent Cases")
-                    fill_ars_number_field(page, ars_list)
-
-                sent_cases_file, sent_cases_error = export_and_download(page)
-                if sent_cases_file:
-                    st.success(f"Exported: {sent_cases_file.name}")
-
-                    with st.spinner(
-                        "Filtering 'Sent' / 'Additional' rows and mapping into "
-                        "'L2 Report sent date' / 'L2 Report sent severity'..."
-                    ):
-                        sent_count, sent_error = add_l2_report_sent_sheet(sent_cases_file)
-
+                if not sc_error:
+                    sent_count, sent_error = add_l2_report_sent_sheet(wb, sc_header, sc_rows)
                     if sent_error:
                         st.error(sent_error)
                     else:
@@ -1766,46 +1805,39 @@ if st.button("🔎 Run ARS Query in MIS", type="primary", use_container_width=Tr
                             f"Added 'L2 Report Sent' tab with {sent_count} row(s) and mapped "
                             "'L2 Report sent date' / 'L2 Report sent severity'"
                         )
-                else:
-                    st.warning(sent_cases_error)
 
-                with st.spinner(
-                    "Marking 'Insufficient'/'On Hold' cases as 'Completed' where "
-                    "L2 Report sent date is populated..."
-                ):
-                    status_count, status_error = update_case_status_from_l2_report_sent()
-
+                status_count, status_error = update_case_status_from_l2_report_sent(wb)
                 if status_error:
                     st.error(status_error)
                 else:
                     st.success(f"Updated Case Status to 'Completed' for {status_count} row(s)")
 
-                with st.spinner("Adding L2 Due Date / L2 TAT / L2 check status columns..."):
-                    summary_success, summary_error = add_l2_summary_columns()
-
+                summary_success, summary_error = add_l2_summary_columns(wb)
                 if summary_success:
                     st.success("Added 'L2 Due Date', 'L2 TAT', and 'L2 check status' columns")
                 else:
                     st.error(summary_error)
 
-                with st.spinner("Building 'Status view' summary report..."):
-                    status_view_success, status_view_error = add_status_view_sheet()
+                wb.save(cleaned_file_path)
 
-                if status_view_success:
-                    st.success("Added 'Status view' summary report")
-                else:
-                    st.error(status_view_error)
+            with st.spinner("Building 'Status view' summary report..."):
+                status_view_success, status_view_error = add_status_view_sheet()
 
-                with st.spinner("Applying professional formatting..."):
-                    style_success, style_error = apply_professional_styling()
+            if status_view_success:
+                st.success("Added 'Status view' summary report")
+            else:
+                st.error(status_view_error)
 
-                if style_success:
-                    st.success("Applied header styling across all tabs")
-                else:
-                    st.error(style_error)
-            except Exception as e:
-                st.error(f"Error running MIS query: {str(e) or type(e).__name__}")
-                st.exception(e)
+            with st.spinner("Applying professional formatting..."):
+                style_success, style_error = apply_professional_styling()
+
+            if style_success:
+                st.success("Applied header styling across all tabs")
+            else:
+                st.error(style_error)
+        except Exception as e:
+            st.error(f"Error running ARS query: {str(e) or type(e).__name__}")
+            st.exception(e)
 
 
 st.markdown("---")
